@@ -1,5 +1,14 @@
 import React, { useState, useEffect } from 'react';
 import { db, initializeDefaultAdmins } from './firebase';
+import { initializeApp, getApp } from 'firebase/app';
+import { 
+  getAuth, 
+  signInWithEmailAndPassword, 
+  signOut, 
+  onAuthStateChanged, 
+  updatePassword,
+  createUserWithEmailAndPassword 
+} from 'firebase/auth';
 import { 
   collection, 
   addDoc, 
@@ -8,8 +17,11 @@ import {
   deleteDoc, 
   updateDoc, 
   getDoc,
-  getDocs 
+  getDocs,
+  setDoc 
 } from 'firebase/firestore';
+
+const auth = getAuth();
 
 // ==========================================
 // IKON-IKON SVG UNTUK TAMPILAN DINAMIS
@@ -187,6 +199,14 @@ export default function App() {
   const [showChangePass, setShowChangePass] = useState(false);
   const [newPassword, setNewPassword] = useState('');
 
+  // State Manajemen Akun Admin Baru (Khusus Superadmin)
+  const [showManageAdminAccountsModal, setShowManageAdminAccountsModal] = useState(false);
+  const [adminUsersList, setAdminUsersList] = useState([]);
+  const [newAdminUsername, setNewAdminUsername] = useState('');
+  const [newAdminEmail, setNewAdminEmail] = useState('');
+  const [newAdminPassword, setNewAdminPassword] = useState('');
+  const [newAdminRole, setNewAdminRole] = useState('bendahara');
+
   // ==========================================
   // STATE DATA KEUANGAN & ASET
   // ==========================================
@@ -252,11 +272,27 @@ export default function App() {
   const [printSignData, setPrintSignData] = useState({ date: '', officer: '', leader: '' });
 
   // ==========================================
-  // FIRESTORE SNAPSHOTS
+  // FIRESTORE SNAPSHOTS & AUTH LISTENER
   // ==========================================
   useEffect(() => {
     initializeDefaultAdmins();
     initializeDefaultPublicData();
+
+    // Pantau status Firebase Authentication
+    const unsubscribeAuth = onAuthStateChanged(auth, async (user) => {
+      if (!user && currentUserRole) {
+        setCurrentUserRole(null);
+        setCurrentUsername(null);
+        sessionStorage.removeItem("rw_user_role");
+        sessionStorage.removeItem("rw_username");
+      }
+    });
+
+    const unsubAdmins = onSnapshot(collection(db, "admin_users"), (snapshot) => {
+      const data = [];
+      snapshot.forEach(d => data.push({ id: d.id, ...d.data() }));
+      setAdminUsersList(data);
+    });
 
     const unsubAsset = onSnapshot(collection(db, "assets"), (snapshot) => {
       const data = [];
@@ -283,6 +319,8 @@ export default function App() {
     });
 
     return () => {
+      unsubscribeAuth();
+      unsubAdmins();
       unsubAsset();
       unsubFinance();
       unsubInfo();
@@ -337,38 +375,57 @@ export default function App() {
     return () => clearInterval(timer);
   }, [isGalleryPaused, activeGallery.length]);
 
-  // Auth Handlers
+  // Auth Handlers (Menggunakan Firebase Authentication)
   const handleLogin = async (e) => {
     e.preventDefault();
-    const uname = loginUsername.trim().toLowerCase();
+    const rawInput = loginUsername.trim();
+    const email = rawInput.includes('@') ? rawInput : `${rawInput.toLowerCase()}@rw05.com`;
+    const uname = rawInput.toLowerCase().split('@')[0];
+
     try {
+      await signInWithEmailAndPassword(auth, email, loginPassword);
+
       const docRef = doc(db, "admin_users", uname);
       const docSnap = await getDoc(docRef);
 
-      if (docSnap.exists() && docSnap.data().password === loginPassword) {
-        const role = docSnap.data().role;
-        setCurrentUserRole(role);
-        setCurrentUsername(uname);
-        sessionStorage.setItem("rw_user_role", role);
-        sessionStorage.setItem("rw_username", uname);
-        alert(`Login berhasil sebagai: ${role.toUpperCase()}`);
-        setShowLoginModal(false);
-        setLoginUsername('');
-        setLoginPassword('');
+      let role = 'superadmin';
+      if (docSnap.exists()) {
+        role = docSnap.data().role;
       } else {
-        alert("Username atau Password salah!");
+        const qSnap = await getDocs(collection(db, "admin_users"));
+        qSnap.forEach(d => {
+          if (d.data().email === email || d.id === uname) {
+            role = d.data().role;
+          }
+        });
       }
+
+      setCurrentUserRole(role);
+      setCurrentUsername(uname);
+      sessionStorage.setItem("rw_user_role", role);
+      sessionStorage.setItem("rw_username", uname);
+
+      alert(`Login berhasil sebagai: ${role.toUpperCase()}`);
+      setShowLoginModal(false);
+      setLoginUsername('');
+      setLoginPassword('');
     } catch (err) {
       console.error(err);
-      alert("Terjadi kesalahan saat login.");
+      alert("Login gagal! Periksa kembali Username/Email dan Password Anda.");
     }
   };
 
-  const handleLogout = () => {
+  const handleLogout = async () => {
+    try {
+      await signOut(auth);
+    } catch (err) {
+      console.error("Gagal logout:", err);
+    }
     setCurrentUserRole(null);
     setCurrentUsername(null);
     sessionStorage.removeItem("rw_user_role");
     sessionStorage.removeItem("rw_username");
+    alert("Berhasil logout.");
   };
 
   const handleChangePassword = async (e) => {
@@ -378,12 +435,85 @@ export default function App() {
       return;
     }
     try {
-      await updateDoc(doc(db, "admin_users", currentUsername), { password: newPassword });
+      const user = auth.currentUser;
+      if (!user) {
+        alert("Sesi login tidak valid. Silakan login ulang terlebih dahulu.");
+        return;
+      }
+      await updatePassword(user, newPassword);
+
+      try {
+        await updateDoc(doc(db, "admin_users", currentUsername), { password: newPassword });
+      } catch (err) {}
+
       alert("Password berhasil diubah!");
       setNewPassword('');
       setShowChangePass(false);
     } catch (err) {
+      console.error(err);
       alert("Gagal mengubah password.");
+    }
+  };
+
+  // Handler Pembuatan Akun Baru oleh Superadmin
+  const handleCreateAdminAccount = async (e) => {
+    e.preventDefault();
+    const uname = newAdminUsername.trim().toLowerCase();
+    const email = newAdminEmail.trim();
+    const password = newAdminPassword;
+    const role = newAdminRole;
+
+    if (!uname || !email || !password || !role) {
+      alert("Semua field harus diisi!");
+      return;
+    }
+    if (password.length < 6) {
+      alert("Password minimal 6 karakter!");
+      return;
+    }
+
+    try {
+      let secondaryApp;
+      try {
+        secondaryApp = getApp("secondaryAppForCreation");
+      } catch (err) {
+        secondaryApp = initializeApp(db.app.options, "secondaryAppForCreation");
+      }
+      const secondaryAuth = getAuth(secondaryApp);
+
+      await createUserWithEmailAndPassword(secondaryAuth, email, password);
+      await signOut(secondaryAuth);
+
+      await setDoc(doc(db, "admin_users", uname), {
+        email: email,
+        role: role,
+        password: password
+      });
+
+      alert(`Akun baru (${uname}) dengan role [${role.toUpperCase()}] berhasil dibuat!`);
+      setNewAdminUsername('');
+      setNewAdminEmail('');
+      setNewAdminPassword('');
+      setNewAdminRole('bendahara');
+    } catch (err) {
+      console.error(err);
+      alert("Gagal membuat akun: " + err.message);
+    }
+  };
+
+  // Handler Hapus Akun Admin
+  const handleDeleteAdminAccount = async (username) => {
+    if (username === 'superadmin') {
+      alert("Akun Superadmin utama tidak dapat dihapus!");
+      return;
+    }
+    if (confirm(`Yakin ingin menghapus akun admin '${username}'?`)) {
+      try {
+        await deleteDoc(doc(db, "admin_users", username));
+        alert("Akun berhasil dihapus dari daftar pengelola.");
+      } catch (err) {
+        alert("Gagal menghapus akun.");
+      }
     }
   };
 
@@ -666,7 +796,7 @@ export default function App() {
               </div>
             </div>
 
-            {/* LINK BANK SAMPAH BERSERI DI BAGIAN TENAS / ATAS */}
+            {/* LINK BANK SAMPAH BERSERI DI BAGIAN TENGAH */}
             <div className="flex-1 flex justify-center order-3 md:order-none w-full md:w-auto">
               <a 
                 href="https://banksampahberseri05.vercel.app/" 
@@ -687,6 +817,15 @@ export default function App() {
                   {currentUserRole ? `${currentUserRole.toUpperCase()} (${currentUsername})` : "Akses Warga"}
                 </span>
               </div>
+
+              {isSuperAdmin && (
+                <button 
+                  onClick={() => setShowManageAdminAccountsModal(true)}
+                  className="text-xs bg-emerald-600/90 hover:bg-emerald-600 text-white font-bold px-3 py-1.5 rounded-full transition-all border border-transparent shadow-sm flex items-center gap-1"
+                >
+                  + Buat Akun Admin
+                </button>
+              )}
 
               {currentUserRole && (
                 <button 
@@ -715,6 +854,124 @@ export default function App() {
             </div>
           </div>
         </header>
+
+        {/* MODAL KELOLA & PEMBUATAN AKUN ADMIN (KHUSUS SUPERADMIN) */}
+        {showManageAdminAccountsModal && (
+          <div className="no-print fixed inset-0 bg-slate-950/60 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+            <div className="bg-white/95 backdrop-blur-md rounded-3xl shadow-2xl p-6 w-full max-w-xl border border-transparent max-h-[90vh] flex flex-col justify-between transform transition-all animate-in fade-in zoom-in-95">
+              <div>
+                <div className="flex items-center justify-between border-b border-slate-200/50 pb-3 mb-4">
+                  <div>
+                    <h3 className="text-base font-bold text-slate-900">Manajemen Akun Pengurus RW</h3>
+                    <p className="text-[11px] text-slate-500">Buat atau kelola akun Bendahara, Pengelola Aset, dan Superadmin</p>
+                  </div>
+                  <button 
+                    onClick={() => setShowManageAdminAccountsModal(false)}
+                    className="p-1 rounded-xl bg-slate-100 hover:bg-slate-200 text-slate-600 font-bold text-xs px-3 py-1.5"
+                  >
+                    &times; Tutup
+                  </button>
+                </div>
+
+                {/* Form Buat Akun Baru */}
+                <form onSubmit={handleCreateAdminAccount} className="bg-slate-50/80 p-4 rounded-2xl border border-slate-200/50 mb-5 space-y-3">
+                  <h4 className="text-xs font-bold text-indigo-900 uppercase tracking-wider flex items-center gap-1.5">
+                    <span className="w-2 h-2 rounded-full bg-emerald-500"></span>
+                    Tambah Akun Baru
+                  </h4>
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                    <div>
+                      <label className="block text-[11px] font-bold text-slate-600 mb-1">Username (ID Dokumen)</label>
+                      <input 
+                        type="text" 
+                        placeholder="contoh: bendahara02" 
+                        value={newAdminUsername}
+                        onChange={(e) => setNewAdminUsername(e.target.value)}
+                        className="w-full p-2.5 bg-white border border-slate-200 rounded-xl text-xs outline-none focus:ring-2 focus:ring-indigo-500/20"
+                        required 
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-[11px] font-bold text-slate-600 mb-1">Email Login</label>
+                      <input 
+                        type="email" 
+                        placeholder="bendahara@rw05.com" 
+                        value={newAdminEmail}
+                        onChange={(e) => setNewAdminEmail(e.target.value)}
+                        className="w-full p-2.5 bg-white border border-slate-200 rounded-xl text-xs outline-none focus:ring-2 focus:ring-indigo-500/20"
+                        required 
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-[11px] font-bold text-slate-600 mb-1">Password (min 6 karakter)</label>
+                      <input 
+                        type="password" 
+                        placeholder="••••••••" 
+                        value={newAdminPassword}
+                        onChange={(e) => setNewAdminPassword(e.target.value)}
+                        className="w-full p-2.5 bg-white border border-slate-200 rounded-xl text-xs outline-none focus:ring-2 focus:ring-indigo-500/20"
+                        required 
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-[11px] font-bold text-slate-600 mb-1">Peran / Role</label>
+                      <select 
+                        value={newAdminRole}
+                        onChange={(e) => setNewAdminRole(e.target.value)}
+                        className="w-full p-2.5 bg-white border border-slate-200 rounded-xl text-xs outline-none focus:ring-2 focus:ring-indigo-500/20 font-semibold"
+                      >
+                        <option value="bendahara">Bendahara</option>
+                        <option value="aset">Pengelola Aset</option>
+                        <option value="superadmin">Superadmin</option>
+                      </select>
+                    </div>
+                  </div>
+                  <div className="pt-1 text-right">
+                    <button type="submit" className="bg-emerald-600 hover:bg-emerald-700 text-white font-bold px-5 py-2 rounded-xl text-xs shadow-md transition active:scale-95">
+                      Buat Akun Sekarang
+                    </button>
+                  </div>
+                </form>
+
+                {/* Daftar Akun yang Sudah Ada */}
+                <h4 className="text-xs font-bold text-slate-700 uppercase tracking-wider mb-2">Daftar Akun Pengurus Terdaftar</h4>
+                <div className="overflow-y-auto max-h-[35vh] space-y-2 pr-1">
+                  {adminUsersList.map((adm) => (
+                    <div key={adm.id} className="p-3 bg-slate-50/80 rounded-2xl border border-slate-200/50 flex items-center justify-between gap-3">
+                      <div>
+                        <div className="flex items-center gap-2">
+                          <span className="font-bold text-xs text-slate-900">{adm.id}</span>
+                          <span className="text-[10px] uppercase font-black px-2 py-0.5 rounded-full bg-indigo-100 text-indigo-800">
+                            {adm.role}
+                          </span>
+                        </div>
+                        <p className="text-[11px] text-slate-500">{adm.email || 'Email tidak tercatat'}</p>
+                      </div>
+
+                      {adm.id !== 'superadmin' && (
+                        <button 
+                          onClick={() => handleDeleteAdminAccount(adm.id)}
+                          className="px-3 py-1 bg-rose-600 hover:bg-rose-700 text-white font-bold text-xs rounded-xl transition"
+                        >
+                          Hapus
+                        </button>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              </div>
+
+              <div className="pt-4 mt-4 border-t border-slate-200 text-right">
+                <button 
+                  onClick={() => setShowManageAdminAccountsModal(false)}
+                  className="bg-slate-200 hover:bg-slate-300 text-slate-700 font-semibold px-4 py-2 rounded-xl text-xs transition"
+                >
+                  Selesai
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
 
         {/* MODAL UBAH PASSWORD */}
         {showChangePass && (
@@ -757,7 +1014,7 @@ export default function App() {
               </div>
               <form onSubmit={handleLogin} className="space-y-3">
                 <div>
-                  <label className="block text-xs font-semibold text-slate-600 mb-1">Username</label>
+                  <label className="block text-xs font-semibold text-slate-600 mb-1">Username / Email</label>
                   <input 
                     type="text" 
                     placeholder="superadmin / bendahara / aset" 
@@ -1183,7 +1440,6 @@ export default function App() {
           {/* ========================================================= */}
           <section className={`printable-section bg-white/80 backdrop-blur-md rounded-3xl p-4 md:p-6 shadow-sm border border-transparent transition-all ${printTarget !== 'finance' ? 'print:hidden' : ''}`}>
             
-            {/* HEADER JUDUL SEKSI DIBERI 'no-print' AGAR HILANG SAAT DICETAK */}
             <div className="no-print flex items-center justify-between border-b border-slate-200/30 pb-4 mb-4">
               <div>
                 <h2 className="text-lg md:text-xl font-bold text-slate-900 tracking-tight">
